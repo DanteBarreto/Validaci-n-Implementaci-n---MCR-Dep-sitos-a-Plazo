@@ -1,0 +1,680 @@
+
+procedure sp_fin_renta_pasivos_mensual (v_periodo number) is
+  
+    v_ult_per_duration number;
+    v_fecha_prima number;
+    v_ultimo_dia number;
+    v_tipo_dia varchar(100);
+    v_dia_faltante number;
+    -----v_periodo_anterior number;
+    v_año number; 
+    v_carga_broad number; 
+    v_dias_intereses number; 
+    v_periodo_sgte number;
+    v_tipo_modelo_conductual varchar(100);
+
+begin
+  
+   --select max(fecha_texto) into v_ultimo_dia from fin_calendario where periodo=v_periodo and fecha<trunc(sysdate);
+   --v_ultimo_dia := 20261031;
+   DECLARE
+    --v_ultimo_dia NUMBER;
+    v_fecha DATE := TRUNC(SYSDATE);
+    
+begin
+    IF TO_CHAR(v_fecha, 'D', 'NLS_DATE_LANGUAGE=ENGLISH') = '2' THEN
+        -- Es lunes
+
+        IF v_fecha = TRUNC(v_fecha, 'MM') THEN
+            -- Lunes y además primer día del mes
+            v_ultimo_dia := TO_NUMBER(TO_CHAR(LAST_DAY(ADD_MONTHS(v_fecha, -1)), 'YYYYMMDD'));
+
+        ELSIF v_fecha - 2 < TRUNC(v_fecha, 'MM') THEN
+            -- Sábado cae en el mes anterior (primer día útil del mes)
+            v_ultimo_dia := TO_NUMBER(TO_CHAR(LAST_DAY(ADD_MONTHS(v_fecha, -1)), 'YYYYMMDD'));
+
+        ELSE
+            -- Lunes normal -> tomar sábado
+            v_ultimo_dia := TO_NUMBER(TO_CHAR(v_fecha - 2, 'YYYYMMDD'));
+        END IF;
+
+    ELSE
+        -- Cualquier otro día -> día anterior
+        v_ultimo_dia := TO_NUMBER(TO_CHAR(v_fecha - 1, 'YYYYMMDD'));
+    END IF;
+  end;
+   
+   select dia_faltante into v_dia_faltante from fin_calendario where fecha_texto =v_ultimo_dia;
+   
+   v_año:=to_number(substr(v_periodo,1,4));
+   ------v_periodo_anterior:=to_number(to_char(add_months(to_date(v_periodo,'YYYYMM'),-1),'YYYYMM'));
+   v_periodo_sgte:=to_number(to_char(add_months(to_date(v_periodo,'YYYYMM'),+1),'YYYYMM'));
+   v_tipo_dia:=(case when v_dia_faltante=1 then 'CIERRE' else 'TIMMING' end);
+   v_tipo_modelo_conductual:=(case when v_periodo>=202601 then 'NUEVA' else 'ACTUAL' end);
+
+  ----El campo duration que se carga de la informacion de daphne es solo informativo
+  ----condiciones para que el proceso funcione para periodos 201901-202006
+  ----condiciones para la tabla de prima de liquidez
+  IF v_periodo between 201901 and 202008 then 
+    select min(periodo) into v_ult_per_duration  from input_pre_duration; 
+    select min(periodo) into v_fecha_prima from fin_prima_liquidez where periodo=v_periodo;
+  ELSE
+    select max(periodo) into v_ult_per_duration from input_pre_duration where periodo<=v_periodo;
+    select max(periodo) into v_fecha_prima from input_pre_duration where periodo<=v_periodo;
+  END IF;
+  
+   ----Para corregir efecto de la carga de la broad sin informacion
+  IF v_periodo=202001 then
+      v_carga_broad:=0;
+  else 
+      select count(1) into v_carga_broad from hd_broad_contable where nu_peri_mes=v_periodo;
+  END IF;
+  
+
+  -----dato de dias de interes para recálculo en el mes
+  if v_dia_faltante=1 then 
+    select  distinct (to_char(last_day(to_date(nu_peri_mes,'YYYYMM')), 'DD'))  into v_dias_intereses from hm_egd where nu_peri_mes=v_periodo;
+  else 
+    select extract(day from max(fecha)) into v_dias_intereses from fin_calendario where periodo=v_periodo and fecha<trunc(sysdate);  
+  end if;
+
+
+   ----llenado de la input_pre_dur_diario (usa la ultima carga de input_pre_duration)
+   execute immediate 'truncate table input_pre_dur_diario';
+   insert into input_pre_dur_diario
+   select to_char(v_periodo) periodo,
+          moneda,
+          descripcion,
+          duration
+   from input_pre_duration where periodo=v_ult_per_duration;
+   commit;
+   
+   -----llenado de input prima liquidez diario (condicion en caso se ejecute el mes actual)
+    execute immediate 'truncate table fin_prim_liqui_diario';
+    insert into fin_prim_liqui_diario
+    select greatest(to_char(v_fecha_prima),v_periodo) periodo,
+           moneda,
+           pl_lar0,
+           pl_ahorro,
+           pl_cts,
+           pl_vista,
+           pl_dpf_retail from fin_prima_liquidez where periodo=v_fecha_prima;
+    commit;
+    
+    ----01.02 Cambio en la tabla de primas para incorporar el cambio en la parte final
+    delete from fin_prima_liquidez where periodo=v_periodo;
+    insert into fin_prima_liquidez
+    select * from fin_prim_liqui_diario;
+    commit;
+
+   delete from fin_dur_pas_diario where periodo =to_char(v_periodo);
+   insert into fin_dur_pas_diario
+   select   to_char(v_periodo)
+             ,a.moneda
+             ,b.duration
+             ,a.brecha
+             ,a.ponderado
+             ,a.descripcion
+             ,a.tipo_metodologia
+   from  tbl_pre_duration a
+   left  join input_pre_dur_diario b
+   on     b.moneda = a.moneda and trim(upper(b.descripcion)) = trim(upper(a.descripcion))
+   where tipo_metodologia in (v_tipo_modelo_conductual);
+   commit;
+   
+    
+      ----tabla a nivel cuenta
+    execute immediate 'truncate table fin_detalle_ingreso_pasivos';
+    insert into fin_detalle_ingreso_pasivos 
+    select nu_peri_mes,co_cliente,nu_cuenta,
+           max(co_analista) co_analista,
+           sum(case when ti_signo='D' then mo_impo_mn else 0 end) - sum(case when ti_signo='C' then mo_impo_mn else 0 end) monto  
+        from hd_broad_contable 
+    where nu_peri_mes=v_periodo and substr(nu_cuen_cont,1,4) in (4111,4121)and nu_cuenta!=0
+    group by nu_peri_mes,co_cliente,nu_cuenta;
+    commit;
+
+    execute immediate 'truncate table fin_resumen_saldos';
+    insert into fin_resumen_saldos
+    select a.c1803 co_cliente,
+           a.cuenta nu_cuenta,
+           a.moneda co_moneda,
+           a.producto co_producto,
+           a.c1758 monto_apertura,
+           a.c1689 nu_plazo,
+           a.c1627 fe_vencimiento,
+           a.c1632 vl_tea,
+           a.c1620 fecha_apertura,
+           a.ordinal nu_ordinal,
+           a.jts_oid in_sald_jts_oid,
+           a.sucursal co_sucursal,
+           a.c7294 monto_intangible,
+           case when producto not in (1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028,
+                                      1029, 1030, 1031, 1032, 1033, 1232, 1251, 1260, 1402, 1403, 1404, 1405, 1400, 1401) 
+            then a.c7294 end monto_intangible_final from saldos a
+    where tz_lock=0  and c9314 in (2, 3, 4);
+    commit;
+    
+ -----Ajuste para tomar el cierre en periodos anteriores   
+ IF v_periodo<202301 then 
+   
+    execute immediate 'truncate table fin_base_renta_pasivo';
+    insert into fin_base_renta_pasivo
+    select distinct
+           nvl(a.nu_peri_mes,v_periodo) periodo,
+           to_date(v_ultimo_dia,'yyyymmdd') fe_proceso,
+           nvl(a.de_tipo_cart,'INGRESO') de_tipo_cartera,
+           nvl(a.co_analista,b.co_analista) co_analista,
+           g.cargo puesto,
+           nvl(a.co_pues_anal,d.co_pues_anal) co_puesto,
+           nvl(a.co_sucu_anal,c.co_sucursal)  co_sucu_anal,
+           nvl(a.co_sucursal,c.co_sucursal)   co_sucursal,
+           nvl(a.co_moneda,c.co_moneda) co_moneda,
+           decode(nvl(a.co_moneda,c.co_moneda), 1, 'PEN' , 2, 'USD', null) flag_moneda,
+           trim(f.nivel_1) grupo_0,
+           nvl(a.co_producto,c.co_producto) co_producto,
+           f.producto nom_producto,
+           nvl(k.segmento_comercial,'Sin segmento') segmento_comercial,
+           case when p.modelo_atencion is null then 'SIN MODELO ATENCION'
+                when p.modelo_atencion ='CRECE EMPRENDEDOR' then 'JUNIY'
+           else p.modelo_atencion end modelo_atencion, 
+           nvl(a.co_cliente,c.co_cliente) co_cliente,
+           f_tipo_documento(e.ti_documento) ti_documento,
+           ltrim(e.nu_documento) nu_documento,
+           nvl(a.nu_cuenta,b.nu_cuenta) nu_cuenta,
+           nvl(a.in_sald_jts_oid,c.in_sald_jts_oid) in_sald_jts_oid,
+           nvl(a.nu_ordinal,c.nu_ordinal) nu_ordinal,
+           fe_maxi_proc fe_ultimo_dia,
+           nvl(a.nu_plaz_dias,c.nu_plazo) plazo,
+           nvl(a.fe_apertura,c.fecha_apertura) fe_apertura,
+           nvl(a.fe_vencimiento,c.fe_vencimiento) fe_vencimiento,
+           nvl(case when a.nu_peri_mes in (202007) then a.vl_tea/100 
+                    when a.co_producto in (2019) then 0.05 else a.vl_tea end,c.vl_tea/100) vl_tea,
+           nvl(a.mo_apertura,c.monto_apertura) mo_apertura,
+           nvl(c.monto_intangible_final,0) monto_intangible,
+           nvl(mo_capi_prom_mn,0) saldo_promedio,
+           nvl(mo_sald_capi_mn,0) saldo_actualizado,
+           nvl(b.monto,0) gasto_financiero ---hay actualizacion al final del proceso para cuenta AFP
+           from
+           (select * from bds.f_fin_saldos_pasivos@dblink_dwh_fin_pla where nu_peri_mes=v_periodo and co_cliente!=0)  a
+    full outer join fin_detalle_ingreso_pasivos b on a.nu_cuenta=b.nu_cuenta
+    left join (select a.* from fin_resumen_saldos a
+               inner join (select nu_cuenta,max(nu_ordinal) nu_ordinal from fin_resumen_saldos
+                           group by nu_cuenta) b on a.nu_cuenta=b.nu_cuenta and a.nu_ordinal=b.nu_ordinal) c on nvl(a.nu_cuenta,b.nu_cuenta)=c.nu_cuenta
+    left join (select nu_peri_mes periodo,co_funcionario,de_puesto co_pues_anal from lkh_s.hm_funcionario_ctr@dblink_dwh_fin_pla where nu_peri_mes=v_periodo) d on nvl(a.co_analista,b.co_analista)=d.co_funcionario
+    left join md_clientes e on nvl(a.co_cliente,c.co_cliente)=e.co_cliente
+    left join fin_dim_productos_pasivos f on nvl(a.co_producto,c.co_producto) = f.cod_producto
+    left join sdbx_inco.dim_puestoscanal g on nvl(a.co_pues_anal,d.co_pues_anal) =g.codigo
+    left join (select * from fin_segmentacion_comercial where substr(periodo_cierre,1,4)=v_año) k on nvl(a.co_cliente,c.co_cliente)=k.co_cliente
+    left join (select distinct a.periodo,a.co_cliente,a.modelo_atencion 
+                      from FIN_MODELO_ATENCION a--sdbx_sco.dn_base_mod_at a 
+               inner join (select co_cliente,max(nu_prestamo) nu_prestamo from FIN_MODELO_ATENCION--sdbx_sco.dn_base_mod_at
+                           where periodo=v_periodo group by co_cliente) b on a.nu_prestamo=b.nu_prestamo 
+               where a.periodo=v_periodo) p on nvl(a.co_cliente,c.co_cliente)=p.co_cliente;
+    commit;
+   
+  else   
+    
+    
+    execute immediate 'truncate table fin_base_renta_pasivo';
+    insert into fin_base_renta_pasivo
+    select distinct
+           nvl(a.nu_peri_mes,v_periodo) periodo,
+           nvl(fe_proceso,to_date(v_ultimo_dia,'yyyymmdd')) fe_proceso,
+           nvl(a.de_tipo_cart,'INGRESO') de_tipo_cartera,
+           nvl(a.co_analista,b.co_analista) co_analista,
+           g.cargo puesto,
+           nvl(a.co_pues_anal,d.co_pues_anal) co_puesto,
+           nvl(a.co_sucu_anal,c.co_sucursal)  co_sucu_anal,
+           nvl(a.co_sucursal,c.co_sucursal)   co_sucursal,
+           nvl(a.co_moneda,c.co_moneda) co_moneda,
+           decode(nvl(a.co_moneda,c.co_moneda), 1, 'PEN' , 2, 'USD', null) flag_moneda,
+           trim(f.nivel_1) grupo_0,
+           nvl(a.co_producto,c.co_producto) co_producto,
+           f.producto nom_producto,
+           nvl(k.segmento_comercial,'Sin segmento') segmento_comercial,
+           case when p.modelo_atencion is null then 'SIN MODELO ATENCION'
+                when p.modelo_atencion ='CRECE EMPRENDEDOR' then 'JUNIY'
+           else p.modelo_atencion end modelo_atencion, 
+           nvl(a.co_cliente,c.co_cliente) co_cliente,
+           f_tipo_documento(e.ti_documento) ti_documento,
+           ltrim(e.nu_documento) nu_documento,
+           nvl(a.nu_cuenta,b.nu_cuenta) nu_cuenta,
+           nvl(a.in_sald_jts_oid,c.in_sald_jts_oid) in_sald_jts_oid,
+           nvl(a.nu_ordinal,c.nu_ordinal) nu_ordinal,
+           fe_maxi_proc fe_ultimo_dia,
+           nvl(a.nu_plaz_dias,c.nu_plazo) plazo,
+           nvl(a.fe_apertura,c.fecha_apertura) fe_apertura,
+           nvl(a.fe_vencimiento,c.fe_vencimiento) fe_vencimiento,
+           nvl(case when a.co_producto in (2019) then 0.05 else a.vl_tea end,c.vl_tea/100) vl_tea,
+           nvl(a.mo_apertura,c.monto_apertura) mo_apertura,
+           nvl(c.monto_intangible_final,0) monto_intangible,
+           nvl(mo_capi_prom_mn,0) saldo_promedio,
+           nvl(mo_sald_capi_mn,0) saldo_actualizado,
+           nvl(b.monto,0) gasto_financiero
+           from
+           (select * from bds.f_fin_saldos_pasivos_d@dblink_dwh_fin_pla where fe_proceso=to_date(v_ultimo_dia,'yyyymmdd') and co_cliente!=0)  a
+    full outer join fin_detalle_ingreso_pasivos b on a.nu_cuenta=b.nu_cuenta
+    left join (select a.* from fin_resumen_saldos a
+               inner join (select nu_cuenta,max(nu_ordinal) nu_ordinal from fin_resumen_saldos
+                           group by nu_cuenta) b on a.nu_cuenta=b.nu_cuenta and a.nu_ordinal=b.nu_ordinal) c on nvl(a.nu_cuenta,b.nu_cuenta)=c.nu_cuenta
+    left join (select nu_peri_mes periodo,co_funcionario,de_puesto co_pues_anal from lkh_s.hm_funcionario_ctr@dblink_dwh_fin_pla where nu_peri_mes=v_periodo) d on nvl(a.co_analista,b.co_analista)=d.co_funcionario
+    left join md_clientes e on nvl(a.co_cliente,c.co_cliente)=e.co_cliente
+    left join fin_dim_productos_pasivos f on nvl(a.co_producto,c.co_producto) = f.cod_producto
+    left join sdbx_inco.dim_puestoscanal g on nvl(a.co_pues_anal,d.co_pues_anal) =g.codigo
+    left join (select * from fin_segmentacion_comercial where substr(periodo_cierre,1,4)=v_año) k on nvl(a.co_cliente,c.co_cliente)=k.co_cliente
+    left join (select distinct a.periodo,a.co_cliente,a.modelo_atencion 
+                      from FIN_MODELO_ATENCION a--sdbx_sco.dn_base_mod_at a 
+               inner join (select co_cliente,max(nu_prestamo) nu_prestamo from FIN_MODELO_ATENCION--sdbx_sco.dn_base_mod_at
+                           where periodo=v_periodo group by co_cliente) b on a.nu_prestamo=b.nu_prestamo 
+               where a.periodo=v_periodo) p on nvl(a.co_cliente,c.co_cliente)=p.co_cliente;
+    commit;
+    
+  END IF;
+    
+    -----Generar etiqueta de clientes
+    execute immediate 'truncate table fin_resumen_flag_empleado';
+    insert into fin_resumen_flag_empleado
+    select distinct
+           a.periodo,a.co_cliente, 
+           case when c.documento is null then 0   ---si no cruza es 100% cliente
+                when c.fecha_salida is null then 1 ----si se mantiene vigente es empleado
+           else 0 end flag_empleado
+    from fin_base_renta_pasivo a
+    left join cl_clientpersona b on b.tz_lock=0 and a.co_cliente=b.c1430
+    left join (select * from fin_detalle_empleado_hm where periodo=v_periodo) c on b.c1431=c.tip_documento and lpad(b.c1432,14,0)=lpad(c.documento,14,0) ;
+    commit;
+    
+    
+    if v_carga_broad=0 then 
+         
+     -----Mario 09.10 (Para el cierre contabiliza la hd_broad_contable) 
+      execute immediate 'truncate table tmp_saldos_diarios';
+      insert into tmp_saldos_diarios
+      select saldo_jts_oid,fecha,interesespago,int_contabilizados
+            from  saldos_diarios a
+       where  a.fecha between to_date(v_periodo,'yyyymm')
+              and last_day(to_date(v_periodo, 'yyyymm'))
+              and (a.interesespago > 0 or a.int_contabilizados > 0);
+      commit;
+
+     --obteniendo datos de intereses pagados a los clientes
+      execute immediate 'truncate table fin_saldos_pagados_pas';
+      insert into fin_saldos_pagados_pas
+      select  d.nu_cuenta
+             ,v_periodo periodo
+             ,c.interesespago
+             ,d.nu_ordinal
+             ,d.monto_intangible
+        from   (select saldo_jts_oid,
+                      max(fecha) fecha
+                from tmp_saldos_diarios
+                group  by saldo_jts_oid) b
+        left   join tmp_saldos_diarios c  on   b.saldo_jts_oid = c.saldo_jts_oid and b.fecha = c.fecha
+        inner  join  (select in_sald_jts_oid,
+                             nu_cuenta,
+                             nu_ordinal,
+                             monto_intangible
+                      from fin_resumen_saldos
+                      where co_producto not in (1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028,
+                                                1029, 1030, 1031, 1032, 1033, 1232, 1251, 1260, 1402, 1403, 1404, 1405, 1400, 1401)) d on b.saldo_jts_oid = d.in_sald_jts_oid;
+        commit;
+        
+   end if;
+
+     execute immediate 'truncate table fin_detalle_canal_gestor';
+     
+     /*IF v_periodo<202308 then 
+     
+      insert into fin_detalle_canal_gestor 
+      select periodo_fin,
+             nu_cuenta,
+             upper(de_canal_captador_fin) de_canal_captador_fin,
+             null captador_captador_egd_fin,
+             co_analista, -----gestor
+             null co_analista_egd_fin,
+             f_asigna_flujo_pasivo(flg_tipo_cta,var_saldo) detalle_flujo
+      from sdbx_inco.hp_pasivos_final_diario
+      where periodo_fin in (v_periodo) and tipo_dia=v_tipo_dia;
+      commit;
+      
+      else       */  
+               
+      insert into fin_detalle_canal_gestor
+      select  periodo_fin, nu_cuenta, 
+              upper(de_canal_captador_fin) canal_gestor,
+              upper(de_canal_captador_fin_egd) canal_captador,
+              co_analista_fin,
+              co_analista_egd_fin,
+              f_asigna_flujo_pasivo(flg_tipo_cta,var_saldo_mn) detalle_flujo           
+     from sdbx_pas.pp_pasivos_diarios  -- solo considerar desde agosto 23
+     where tipo_dia in (v_tipo_dia) and periodo_fin in (v_periodo);
+     commit;
+   
+ /*   END IF;
+          */
+    
+   execute immediate 'truncate table fin_base_renta_pas_total';
+   insert into fin_base_renta_pas_total
+   select a.*,
+          decode(trim(a.grupo_0),'Deposito a Plazo Fijo', e.tt , 0) as tt_pasiva_dpf_antigua,
+          null
+          from 
+   (select a.periodo,
+           case when g.nu_cuenta is not null then 'STOCK' 
+                when a.de_tipo_cartera ='INGRESO' then 'INGRESO' else 'CANCELADO' end tipo_cartera,
+           a.fe_proceso,
+           a.flag_moneda,
+           a.co_moneda moneda,
+           a.segmento_comercial,
+           a.modelo_atencion,
+           nvl(f.segmento,'N') segmento,
+           a.co_cliente,
+           a.ti_documento,
+           a.nu_documento,
+           nvl(p.flag_empleado,0) flag_empleado,
+           f_familia_producto_pas(a.grupo_0) familia,
+           a.grupo_0,
+           a.co_producto,
+           a.nom_producto,
+           g.tipo_flujo flag_flujo,
+           k.marca tipo_apertura,
+           a.nu_cuenta nu_cuenta,
+           a.plazo plazo,
+           a.nu_ordinal,
+           a.in_sald_jts_oid,
+           a.fe_apertura,
+           a.fe_vencimiento,
+           a.vl_tea tasa,
+           a.co_sucu_anal,
+           a.co_sucursal, 
+           a.co_puesto,
+           a.puesto, ----canal
+           g.de_canal_captador_fin,
+           g.co_analista_fin,
+           g.de_canal_captador_egd_fin,
+           nvl(g.co_analista_egd_fin,a.co_analista) co_analista_captador,
+           a.monto_intangible,
+           a.mo_apertura,
+           a.saldo_cierre saldo_cierre,
+           a.saldo_promedio saldo_promedio,
+           case when to_char(a.fe_apertura, 'YYYYMM') between 202104 and a.periodo and trim(a.grupo_0) in ('Deposito a Plazo Fijo') then  d.plazo_conductual else a.plazo end as plazo_conductual,
+           0 plazo_conductual_nuevo,
+           case when (a.fe_apertura >= to_date('01/06/2015','DD/MM/YYYY')) or (a.fe_apertura >= to_date('01/10/2006','DD/MM/YYYY')
+                and a.plazo in (30, 60, 90, 180, 360, 720, 1080, 1800, 2520, 3600)) then a.fe_apertura else to_date('01/06/2015','DD/MM/YYYY')
+          end fecha_apertura_duration,
+          case when a.fe_apertura >= to_date('01/06/2015','DD/MM/YYYY') then a.fe_apertura
+               when a.fe_apertura >= to_date('01/10/2006', 'DD/MM/YYYY') and a.plazo in (30, 60, 90, 180, 360, 720, 1080, 1800, 2520, 3600) then a.fe_apertura
+          else to_date('01/06/2015', 'DD/MM/YYYY') end fecha_apertura_tt,
+           -----se agregaran como condiciones
+           case when v_carga_broad=0 and trim(a.grupo_0) not in  ('Deposito a Plazo Fijo') then b.interesespago
+                when v_carga_broad!=0 and trim(a.grupo_0) not in ('Deposito a Plazo Fijo') then a.gasto_financiero else 0 end interes_vista,
+           case when v_carga_broad=0 and trim(a.grupo_0) in      ('Deposito a Plazo Fijo') then a.saldo_promedio * (power(1 + (a.vl_tea), v_dias_intereses / 360) - 1)
+                when v_carga_broad!=0 and trim(a.grupo_0) in     ('Deposito a Plazo Fijo') then a.gasto_financiero else 0 end intereses_no_vista,
+           case when v_carga_broad=0 and trim(a.grupo_0) in      ('Deposito a Plazo Fijo') then a.saldo_promedio * (power(1 + (a.vl_tea), v_dias_intereses / 360) - 1)
+                when v_carga_broad=0 and trim(a.grupo_0) not in  ('Deposito a Plazo Fijo') then b.interesespago
+                when v_carga_broad!=0 then a.gasto_financiero end intereses_pagados
+    from fin_base_renta_pasivo a
+    left join sdbx_pla.fin_saldos_pagados_pas b                                       on a.periodo = b.periodo and a.nu_cuenta = b.cuenta and a.nu_ordinal = b.ordinal ---saldos diarios 
+    -----left join sdbx_pla.fin_cli_transfer_bp c                                          on a.periodo >= c.periodo and a.co_cliente = c.co_cliente
+    left join (select * from modelo_conductual where tipo_metodologia=v_tipo_modelo_conductual) d     on a.plazo = d.plazo_contractual
+    left join fin_detalle_canal_gestor g on a.nu_cuenta=g.nu_cuenta 
+    left join (select * from sdbx_pas.mp_pas_aperturas_mens where periodo=v_periodo) k on  a.nu_cuenta=k.cuenta
+    left join (select co_cliente,max(flag_empleado) flag_empleado from fin_resumen_flag_empleado
+               group by co_cliente) p on a.co_cliente=p.co_cliente
+    left join (select * from ew_segm.mbco_segmento_rie_gestion@dblink_dbsanbox0_expdwh_sdbx_pla 
+               where periodo_cierre=v_periodo) f    on a.nu_documento=f.num_doc and decode(f.tip_doc, '1', 'C', '2', 'E', '5', 'P', '9', 'R', 'O')= a.ti_documento ) a    
+    left join fin_tt_pasivo_dist_total e            on  a.flag_moneda = e.moneda and a.plazo_conductual = e.plazo and a.fecha_apertura_tt = e.fecha;
+    commit;
+        
+    ----Ajuste 18.07 ahora incluye la nueva curva de CTS (no afecta el actual proceso) 
+    delete from fin_tt_caracterizacion_3 where periodo = to_char(v_periodo);
+    insert into fin_tt_caracterizacion_3
+    select periodo
+          ,familia
+          ,moneda
+          ,sum(tt_ponderada_antigua) tt_ponderada
+    from   (select a.periodo
+                  ,a.moneda
+                  ,a.familia
+                  ,a.brecha
+                  ,a.ponderado
+                  ,round(avg(b.tt), 4) as prom_tt
+                  ,(round(avg(b.tt), 4) * a.ponderado) as tt_ponderada_antigua
+            from   (select periodo
+                          ,to_char(add_months(to_date(periodo,'YYYYMM'), (-1 * round(brecha / 30, 0)) + 1), 'YYYYMM') periodo_anterior
+                          ,decode(moneda, 1,'PEN' ,'USD') des_moneda
+                          ,moneda
+                          ,upper(descripcion) familia
+                          ,brecha
+                          ,ponderado
+                    from  fin_dur_pas_diario
+                    where  periodo = v_periodo) a
+    left   join fin_tt_pasivo_dist_total b  on a.brecha = b.plazo and a.des_moneda = b.moneda
+    where  b.periodo between a.periodo_anterior and a.periodo
+    group  by a.periodo,a.moneda, a.familia,a.brecha,a.ponderado) tt_prom
+    group  by periodo,familia,moneda;
+    commit;
+    
+    -------Dinero Fresco: Monto neto apertura
+    execute immediate 'truncate table fin_base_dinero_fresco';
+    insert into fin_base_dinero_fresco 
+    with base_dinero_fresco as (
+    select periodo_fin,
+           co_cliente,
+           sum(dinero_fresco_dpf) dinero_fresco_dpf,
+           sum(dinero_fresco_fah) dinero_fresco_fah,
+           sum(dinero_fresco_aho_neg) dinero_fresco_aho_neg,
+           sum(dinero_fresco_aho) dinero_fresco_aho,
+           sum(dinero_fresco_cts) dinero_fresco_cts,
+           sum(dinero_fresco_cco) dinero_fresco_cco 
+           from sdbx_pas.pp_dinero_fresco_comp
+    where periodo_fin=v_periodo and tipo_dia='CIERRE' group by periodo_fin,co_cliente)
+
+    select a.* from (
+    select periodo_fin,
+           co_cliente,
+           tipo_producto,
+           monto_dinero_fresco from base_dinero_fresco 
+           unpivot (
+             monto_dinero_fresco for tipo_producto 
+             in (dinero_fresco_dpf as 'Deposito a Plazo Fijo', dinero_fresco_fah as 'Full Ahorro' , 
+                 dinero_fresco_aho_neg as 'Cuenta Ahorro Negocio', dinero_fresco_aho as 'Ahorro',
+                 dinero_fresco_cts as 'CTS', dinero_fresco_cco as 'Cuenta Corriente')
+               )) a
+    where monto_dinero_fresco>0;
+    commit;
+    
+    execute immediate 'truncate table fin_detalle_dinero_fresco';
+    insert into fin_detalle_dinero_fresco
+    with base_producto as (
+    select periodo,co_cliente,nu_cuenta,
+           canal_gestor,grupo_0,saldo_cierre,
+           case when trim(a.grupo_0)='Deposito a Plazo Fijo' then trim(a.grupo_0) 
+                when trim(a.grupo_0)='Vista' then 'Cuenta Corriente'
+                when trim(a.grupo_0)='CTS' then 'CTS'
+                when trim(a.grupo_0) in ('Cuenta Ahorro Negocio','Full Ahorro') then grupo_0 else grupo_0 end grupo_final
+    from fin_base_renta_pas_total a
+    where periodo in (v_periodo) and flag_flujo in ('01. Aperturas','02. Depositos'))
+
+
+    select a.periodo,
+           a.co_cliente,
+           a.nu_cuenta,
+           a.grupo_final,
+           sum(saldo_cierre) over (partition by a.co_cliente order by grupo_final) suma_acum,
+           rank() over (partition by a.co_cliente order by saldo_cierre asc) orden,
+           -----monto_dinero_fresco
+           case when sum(saldo_cierre) over (partition by a.co_cliente,grupo_final order by grupo_final) =0 then 0 else 
+                 (a.saldo_cierre/(sum(saldo_cierre) over (partition by a.co_cliente,grupo_final order by grupo_final)))*c.monto_dinero_fresco 
+           end dinero_fresco 
+       from base_producto a
+    left join fin_base_dinero_fresco c on a.co_cliente=c.co_cliente and a.grupo_final =c.tipo_producto;
+    commit;
+    ----------------------------------------------
+
+    delete from fin_cubo_renta_pas where periodo=v_periodo;
+    insert into fin_cubo_renta_pas
+    select distinct 
+           t2.periodo periodo,
+           'PASIVO' grupo_familia,
+           t2.fe_proceso,
+           null fe_actualizacion,
+           t2.tipo_cartera,
+           ------agregar campos
+           f_asigna_rango_monto_pasivo(t2.monto_apertura) rango_apertura,
+           f_asigna_rango_plazo_pasivo(trim(t2.grupo_0),t2.plazo) grupo_plazo,
+           t2.segmento,
+           t2.segmento_comercial,
+           t2.modelo_atencion,
+           t2.co_cliente,
+           t2.ti_documento,
+           t2.nu_documento,
+           t2.flag_empleado,
+           t2.familia,
+           case when t2.co_producto in (2001) then 'Cuenta Ahorra y Gana'
+                when t2.co_producto in (2019) then 'Cuenta Super Tasa AFP'
+           else trim(t2.grupo_0) end grupo_0,
+           t2.co_producto,
+           t2.nombre_producto,
+           t2.flag_flujo,
+           t2.tipo_apertura,
+           t2.co_sucu_anal,
+           t2.co_sucursal,
+           t2.canal_gestor,
+           t2.co_analista_gestor,
+           t2.canal_captador,
+           t2.co_analista_captador,
+           t2.nu_cuenta,  
+           t2.plazo,
+           t2.nu_ordinal,
+           t2.moneda,
+           t2.in_sald_jts_oid,
+           case when t2.tipo_cartera in ('INGRESO') then 0 else 1 end flg_base_renta, 
+           to_char(t2.fe_apertura,'yyyymm') periodo_apertura,
+           t2.fe_apertura,
+           t2.fe_vencimiento,
+           t2.tasa_tea,
+           t2.monto_apertura,
+           nvl(e.dinero_fresco,0) monto_apertura_neto,
+           t2.saldo_cierre,
+           t2.saldo_promedio,
+           t2.duration,
+           case when t2.familia='DPF' then tt_pasiva_dpf_antigua else c.tt_ponderada end,
+           -------case when t2.fe_apertura < to_date('01/01/2019', 'DD/MM/YYYY') then 0 else  decode(t2.familia, 'DPF', tt_pasiva_dpf_antigua, c.tt_ponderada) end as tt_sin_pl,
+           f_tt_pasiva_geb(t2.periodo,t2.fe_apertura, t2.familia_2, t2.tt_pasiva_dpf_antigua, c.tt_ponderada, d.monto_prima,  c_post.tt_ponderada)  as tt_pasiva_geb,
+                   
+           t2.saldo_promedio *  (power((1 + f_pasivo_if_0_nuevo(t2.periodo,t2.fe_apertura, t2.familia_2, t2.tt_pasiva_dpf_antigua, c.tt_ponderada, d.monto_prima, c_post.tt_ponderada, t2.tangible, c_post.tt_ponderada, t2.intangible,t2.saldo_cierre)), ((to_char(last_day(to_date(t2.periodo,'yyyymm')), 'dd')) / 360)) - 1) as ingreso_financiero,
+           nvl(t2.intereses_pagados, 0) as gasto_financiero,
+           0 mo_costo_venta_directo,
+           0 mo_costo_venta_indirecto,
+           0 mo_ajuste_gast_total        
+    from   (select a.periodo,
+                   a.tipo_cartera,
+                   a.fe_proceso,
+                   a.flag_moneda,
+                   a.moneda,
+                   a.segmento,
+                   a.segmento_comercial,
+                   a.modelo_atencion,
+                   a.co_cliente,
+                   a.ti_documento,
+                   a.nu_documento,
+                   a.flag_empleado,
+                   f_grupo_producto(a.familia, a.canal_captador, a.nombre_producto, a.flag_empleado) grupo_producto,
+                   f_familia_producto_2(a.periodo,a.familia, a.flag_empleado, a.grupo_0) as familia_2,
+                   a.familia,
+                   a.grupo_0,
+                   a.co_producto,
+                   a.nombre_producto,
+                   a.flag_flujo,
+                   a.tipo_apertura,
+                   a.nu_cuenta,
+                   a.plazo,
+                   a.nu_ordinal,
+                   a.in_sald_jts_oid,
+                   a.fe_apertura,
+                   a.fe_vencimiento,
+                   a.tasa_tea,
+                   a.co_sucu_anal,
+                   a.co_sucursal,
+                   a.co_puesto,
+                   a.canal,
+                   a.canal_gestor,
+                   a.co_analista_gestor,
+                   a.canal_captador,
+                   a.co_analista_captador,
+                   a.monto_intangible,
+                   a.monto_apertura,
+                   a.saldo_cierre,
+                   a.saldo_promedio,
+                   a.intereses_pagados,
+                   -----Aplicar cambios en el 2019 para que en la practica asigne como tangilbe  y luego intangible
+                   case when a.periodo between 201901 and 202012 then 
+                        case when a.familia ='CTS'  and a.saldo_cierre + nvl(a.monto_intangible,0) < 0 then  0
+                             when a.familia ='CTS'  and a.saldo_cierre + nvl(a.monto_intangible,0) >= 0 then a.saldo_cierre + a.monto_intangible
+                        else 0 end 
+                   else  
+                       case when a.familia = 'CTS' and a.saldo_cierre + nvl(a.monto_intangible,0) < 0  then a.saldo_cierre
+                            when a.familia = 'CTS' and a.saldo_cierre + nvl(a.monto_intangible,0) >= 0 then abs(a.monto_intangible)
+                       else 0 end 
+                   end as intangible,
+                   ----2019 como intangible 
+                   case when a.periodo between 201901 and 202012 then        
+                     case when a.familia = 'CTS' and a.saldo_cierre + nvl(a.monto_intangible,0) < 0  then a.saldo_cierre
+                          when a.familia = 'CTS' and a.saldo_cierre + nvl(a.monto_intangible,0) >= 0 then abs(a.monto_intangible)
+                     else 0 end
+                   else 
+                     ----desde 2020 como tangible normalmente
+                     case when a.familia ='CTS'  and a.saldo_cierre + nvl(a.monto_intangible,0) < 0 then  0
+                          when a.familia ='CTS'  and a.saldo_cierre + nvl(a.monto_intangible,0) >= 0 then a.saldo_cierre + a.monto_intangible
+                     else 0 end 
+                   end as tangible,
+                   a.tt_pasiva_dpf_antigua,
+                   decode(a.familia, 'DPF', a.plazo, dp.duration) as duration,
+                   -----cambio en la forma de aplicar la prima liquidez (02.01.2026)
+                   case when a.periodo<202601 then a.periodo else 
+                        case when familia!='DPF' then a.periodo else 
+                             case when to_char(fecha_apertura_tt,'yyyymm')>=202601 then to_number(to_char(fecha_apertura_tt,'yyyymm')) else a.periodo end 
+                        end 
+                   end periodo_apertura_tt
+
+            from  fin_base_renta_pas_total a 
+            left   join (select distinct periodo
+                                       ,moneda
+                                       ,duration
+                                       ,descripcion
+                        from sdbx_pla.fin_dur_pas_diario) dp
+            on a.periodo = dp.periodo and upper(trim(dp.descripcion)) = upper(trim(a.familia)) and a.moneda = dp.moneda
+            ) t2
+    left join sdbx_pla.fin_tt_caracterizacion_3 c    on t2.periodo = c.periodo and upper(trim(t2.familia_2)) = upper(trim(c.familia)) and t2.moneda = c.moneda
+    -----cambiando la condicion en la funcion f_familia_producto_2 se genera mediante la misma logica (solamente falta definir la fecha en que aplicaría el cambio)
+    left join sdbx_pla.fin_tt_caracterizacion_3 c_post on  t2.periodo = c_post.periodo and decode(upper(trim(t2.familia_2)),'CTS','CTS POST RETIRO',null) = upper(trim(c_post.familia)) and t2.moneda = c_post.moneda
+    left join sdbx_pla.fin_tt_caracterizacion_3 c_t  on  t2.periodo = c_t.periodo and decode(upper(trim(t2.familia_2)),'CTS EMP', 'CTS E T','CTS NO EMP', 'CTS NE T','CTS','CTS POST RETIRO',null) = upper(trim(c_t.familia)) and t2.moneda = c_t.moneda
+    left join sdbx_pla.fin_tt_caracterizacion_3 c_i  on t2.periodo = c_i.periodo and decode(upper(trim(t2.familia_2)),'CTS EMP', 'CTS E I', 'CTS NO EMP','CTS NE I','CTS', 'CTS POST RETIRO',null) = upper(trim(c_i.familia)) and t2.moneda = c_i.moneda
+    left join fin_prima_liquidez_final  d  on t2.periodo_apertura_tt=d.periodo and t2.flag_moneda = d.moneda and t2.familia=d.familia-----cambio tabla de prima de liquidez
+    left join sdbx_pla.fin_detalle_dinero_fresco e on t2.periodo=e.periodo and t2.nu_cuenta=e.nu_cuenta;
+    commit;
+    
+  IF v_periodo<=202605 then 
+    -----08.01 Ajuste para interes del producto Super Tasas AFP
+    merge into (select * from fin_cubo_renta_pas 
+            where periodo=v_periodo and grupo_producto='Cuenta Super Tasa AFP') a
+    using (select saldo_jts_oid,sum(gasto_financiero) gasto_financiero from (
+           select a.saldo_jts_oid,a.fecha_valor,
+                  concepto,equivalentemn gasto_financiero,
+                  rank() over (partition by saldo_jts_oid order by fecha_valor asc) orden 
+           from historia_vista a
+           inner join (select nu_cuenta,in_sald_jts_oid from fin_cubo_renta_pas 
+                       where periodo=v_periodo and grupo_producto='Cuenta Super Tasa AFP') b on a.saldo_jts_oid=b.in_sald_jts_oid
+           where concepto='Transferencia -Abono en cuenta' and to_char(fecha_valor,'yyyymm')=v_periodo_sgte)
+           where orden=1
+           group by saldo_jts_oid) b 
+    on (a.in_sald_jts_oid=b.saldo_jts_oid)
+    when matched then 
+      update set a.gast_fin_total=b.gasto_financiero;
+    commit;
+    
+  END IF;
+    
+end sp_fin_renta_pasivos_mensual;
