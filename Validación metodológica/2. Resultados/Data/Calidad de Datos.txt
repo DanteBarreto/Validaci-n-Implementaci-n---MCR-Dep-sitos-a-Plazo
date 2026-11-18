@@ -1,0 +1,41 @@
+Calidad de Datos
+
+Control 4.4
+-Cómo se realizó el cuadre de la información de SQL.
+
+Control 4.6
+-42 cuentas con información posterior a Fecha_Vencimiento (información como más de 10 Fecha_Proceso)
+
+Control 4.7
+-22 cuentas con más de una Fecha_Apertura
+
+Control 4.9
+-107 cuentas con más de una Fecha_Vencimiento
+
+Control 4.11
+-107 cuentas con más de un Plazo.
+
+Control 4.12
+-14 cuentas con más de un CODIGO_PRODUCTO.
+
+Control 4.16
+-4649 cuentas con más de una TASA_INTERES.
+
+
+Controles: Unicidad Fecha Vencimiento | Unicidad Fecha Apertura 
+Existen depósitos donde hay más de una fecha de vencimiento. Algunas es porque se pacta una renovación y otra es porque de manera automática se renueva. 
+Se debe averiguar con negocio por cuánto tiempo se renueva de forma automática?
+
+-Consistencia: FECHAAPERTURA=MIN(FECHAPROCESO)
+Existen depósitos donde no se cumple el control
+
+-Consistencia: FECHAVENCIMIENTO=MAX(FECHAPROCESO)
+Existen depósitos donde no se cumple el control
+
+-Consistencia: 
+
+-Unicidad CODIGO_PRODUCTO
+Modelamiento detectó 18 (VIRF 14), pero debe diferenciar que puede cambiar el código si cambia la FECHA_APERTURA.
+
+-CAPITAL 0:
+En la data actual hay un campo que se llama estado. Este campo debe filtrarse como VIGENTE. También se observa que cuando FECHAPROCESO=FECHAAPERTURA se puede observar el capital como 0, entonces esto debe filtrarse.

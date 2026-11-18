@@ -1,0 +1,1 @@
+La diferencia de dias, con los que se evalúa el plazo de un prestamo es entre Min_FechaProceso y Max_FechaProceso
