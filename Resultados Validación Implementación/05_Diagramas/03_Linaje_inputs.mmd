@@ -1,0 +1,59 @@
+flowchart LR
+  classDef gaps fill:#dbeafe,stroke:#1d4ed8,color:#0b1b3f
+  classDef asig fill:#dcfce7,stroke:#15803d,color:#052e16
+  classDef comp fill:#fef3c7,stroke:#b45309,color:#3b2402
+  classDef manual stroke-dasharray:6 4,stroke-width:2px
+  classDef ctrlok stroke:#15803d,stroke-width:3px
+  classDef ctrlno stroke:#dc2626,stroke-width:3px
+
+  subgraph FU["Fuente de origen"]
+    F1["Riesgos de Mercado BCP / COE<br/>(curva conductual corporativa)"]:::comp
+    F2["SP + job diario<br/>Base DPF DD.MM.xlsx"]:::gaps
+    F3["Parametrización área<br/>(Aux, Calculadora, fecha)"]:::gaps
+    F4["DWH f_fin_saldos_pasivos_d<br/>core saldos, broad contable"]:::asig
+    F5["Gestión Inf. Financiera<br/>TT y prima de liquidez"]:::asig
+    F6["Riesgo de Tesorería<br/>modelo_conductual, pesos"]:::asig
+    F7["Esquemas sandbox sdbx_*"]:::asig
+  end
+  subgraph EX["Extracción / carga"]
+    E1["Digitación / pegado en<br/>'Curvas GAP Modelo' ✖"]:::gaps
+    E2["Botón 2 Importar Data ✖<br/>+ borrado manual de filas"]:::gaps
+    E3["Carga tabla modelo_conductual ✖"]:::asig
+    E4["Lectura directa por SP<br/>(dblink) ✖"]:::asig
+  end
+  subgraph TF["Transformaciones"]
+    X1["Botón 3: FLAG / CURVA / marcas;<br/>relleno de nodos CURVAS ✖"]:::gaps
+    X2["Plazo conductual, fecha apertura TT,<br/>prima, joins ✖"]:::asig
+  end
+  subgraph MO["Modelo"]
+    M1["GAPS: Script R (RStudio)<br/>desgaste por bandas"]:::gaps
+    M2["Asignado: SP PL/SQL<br/>+ 9 funciones no provistas"]:::asig
+  end
+  subgraph OU["Outputs"]
+    O1["Output_R01 / Data_Macro_ALM_DPF<br/>✔ cuadre de monto (Parámetros H22)"]:::gaps
+    O2["Log de tiempos ✔"]:::gaps
+    O3["FIN_CUBO_RENTA_PAS ✖"]:::asig
+  end
+  subgraph US["Usuario / reporte final"]
+    U1["Macro ALM → GAPS liquidez y reprecio<br/>(Riesgos de Tesorería)"]:::gaps
+    U2["Rentabilidad, Presupuesto, Tesorería,<br/>Reporte ALM, Alta Gerencia"]:::asig
+  end
+
+  F1 --> E1
+  F1 -.->|"Por confirmar: mismo origen"| E3
+  F2 --> E2
+  F3 --> X1
+  E1 --> X1
+  E2 --> X1 --> M1
+  F6 --> E3 --> X2
+  F4 --> E4
+  F5 --> E4
+  F7 --> E4 --> X2 --> M2
+  M1 --> O1 --> U1
+  M1 --> O2
+  M2 --> O3 --> U2
+  O3 -.->|"Por confirmar: Reporte ALM"| U1
+
+  class E1,E2,E3,F3 manual
+  class O1,O2 ctrlok
+  class E1,E2,E3,E4,X1,X2,O3 ctrlno

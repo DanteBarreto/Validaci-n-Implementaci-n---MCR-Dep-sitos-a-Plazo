@@ -1,0 +1,35 @@
+flowchart TD
+  subgraph IN["Inputs (Oracle)"]
+    B1["bds.f_fin_saldos_pasivos_d (DWH, fe_proceso = último día)<br/>+ saldos (core) + hd_broad_contable"]
+    B2["modelo_conductual<br/>(plazo contractual → conductual; ACTUAL / NUEVA)"]
+    B3["fin_tt_pasivo_dist_total<br/>(TT por moneda, plazo y fecha)"]
+    B4["fin_prima_liquidez / fin_prima_liquidez_final"]
+    B5["Dimensiones DWH y tablas sandbox sdbx_*<br/>(canal, flujo, segmento, dinero fresco)"]
+    B6["v_periodo (parámetro) y SYSDATE (v_ultimo_dia)"]
+  end
+  subgraph TR["Transformaciones (SP sp_fin_renta_pasivos_mensual)"]
+    T1["fin_base_renta_pasivo: universo de pasivos por cuenta<br/>(full outer join saldos DWH con gasto contable; NVL con core)"]
+    T2["fin_base_renta_pas_total: para DPF con apertura entre 202104 y el periodo,<br/>plazo_conductual = modelo_conductual(plazo); resto plazo contractual"]
+    T3["fecha_apertura_tt: aperturas < 01/06/2015 → 01/06/2015<br/>(salvo plazos estándar desde 01/10/2006)"]
+    T4["TT DPF = fin_tt_pasivo_dist_total(moneda, plazo_conductual, fecha_apertura_tt)"]
+  end
+  subgraph CA["Cálculo"]
+    C1["Prima de liquidez: para DPF desde 202601 por periodo de apertura"]
+    C2["TT_PASIVA_GEB = f_tt_pasiva_geb(...) (función no provista)"]
+    C3["ING_FIN_TOTAL = saldo_promedio × ((1 + f_pasivo_if_0_nuevo(...))^(días mes/360) − 1)"]
+    C4["GAST_FIN_TOTAL = intereses pagados (broad contable o TEA)"]
+  end
+  subgraph OUT["Outputs"]
+    O1["FIN_CUBO_RENTA_PAS (periodo)"]
+    O2["Reportes: rentabilidad, presupuesto, Reporte ALM, comités"]
+  end
+  B1 --> T1 --> T2
+  B5 --> T1
+  B2 --> T2 --> T3 --> T4
+  B3 --> T4
+  B6 --> T1
+  T4 --> C1 --> C2 --> C3
+  B4 --> C1
+  T1 --> C4
+  C3 --> O1
+  C4 --> O1 --> O2

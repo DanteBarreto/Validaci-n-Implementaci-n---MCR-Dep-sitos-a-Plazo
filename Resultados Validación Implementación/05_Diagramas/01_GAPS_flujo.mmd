@@ -1,0 +1,39 @@
+flowchart TD
+  subgraph IN["Inputs"]
+    A1["Base DPF DD.MM.xlsx<br/>(SP + job diario, '14 - Bases diarias')"]
+    A2["Curvas GAP Modelo<br/>(COE Riesgo de Mercado, carga manual)"]
+    A3["Hojas Aux / Calculadora<br/>(reglas FLAG, CURVA, marcas)"]
+    A4["Fecha de cierre (hoja Parámetros)"]
+    A5["Script R desde ruta de respaldo<br/>'26. Respaldo de Archivos'"]
+  end
+  subgraph TR["Transformaciones (Macro VBA)"]
+    T1["Botón 2: importar 26 de 49 columnas a hoja Data"]
+    T2["Botón 3a: por operación asigna MARCAORIGEN_C, MARCA_CONTA,<br/>FLAG (RUBRO 2313/2323 → IFIS; MARCAORIGEN=TESORERIA → NO IFIS; resto RETAIL)<br/>y CURVA (IFIS → CONTRACTUAL)"]
+    T3["Botón 3b: CURVAS = nodos mensuales 1..N meses<br/>(N = ⌈máx. días (VTO − APT) / 30⌉ en la data; sep-2026: 241);<br/>relleno de nodos faltantes con curva del nodo superior / inferior; último nodo = 1"]
+    T4["Botón 4: exporta Base_DPF_AAAAMMDD.csv, CURVAS.xlsx, Data_Parametros.csv"]
+  end
+  subgraph CA["Cálculo (Script R, ejecución manual en RStudio)"]
+    C1["Partición en archivos de 1.000 registros"]
+    C2["Meses apertura = ⌈(VTO − APT)/30⌉; meses remanentes = máx(mín(⌈(VTO − PROCESO)/30⌉, apertura), 1)"]
+    C3["Banda k: Capital_k = d(nodo transcurridos+k) × (Saldo − Σ Capital previos), último nodo d = 1"]
+    C4["Interés sólo en última banda: Capital_último × ((1+TEA)^(PLAZO/360) − 1)"]
+    C5["CONTRACTUAL: flujo único con bandas originales de la base"]
+    C6["Asignación de bandas GAP_GER, GAP_AX7, GAP_REPRECIO, GAP_CE (k × 30 días)"]
+  end
+  subgraph OUT["Outputs"]
+    O1["Resultados_*.csv (detalle por operación y banda)"]
+    O2["Output_R01_Reporte (agregado, 401 filas)"]
+    O3["Output_R02_Log_Tiempos"]
+    O4["Data_Macro_ALM_DPF_AAAAMMDD.xlsx<br/>(botón 6)"]
+    O5["Macro ALM → hoja DPF → GAPS de liquidez / reprecio"]
+  end
+  A1 --> T1 --> T2 --> T4
+  A3 --> T2
+  A2 --> T3 --> T4
+  A4 --> T1
+  A5 --> C1
+  T4 --> C1 --> C2 --> C3 --> C4 --> C6
+  C1 --> C5 --> C6
+  C6 --> O1
+  C6 --> O2 --> O4 --> O5
+  C1 --> O3
